@@ -1,18 +1,17 @@
-import requests
+from pyexpat import ExpatError
 from rss_parser import RSSParser
 from requests import get
-import psycopg2
-from apscheduler.schedulers.background import BackgroundScheduler
-import numpy as np
-from numpy.linalg import norm
-import ast
 import hashlib
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
+from chunkNewsArticles import update_or_add_full_news_articles_from_rss
 from openai import OpenAI
 
-from db import helper_select_db, helper_insert_db
+from db import helper_select_db, helper_insert_db, helper_insert_many_db
 
 current_news_articles_db = None
 uploaded_article = False
+dt_old_rss_fetch_update = None
 
 client = OpenAI()
 
@@ -36,45 +35,7 @@ class WebRSS:
     pass
 
 
-def check_rss_sites_to_fetch_articles(rss_sites):
-    fetch_from_rss_sites = []
 
-    for rss_site in rss_sites:
-        if(add_or_update_rss_site(rss_site)):
-            fetch_from_rss_sites.append(rss_site)
-        else:
-            continue
-
-    print("break")
-    return fetch_from_rss_sites
-    
-
-# avoid going through rss site if it hasn't changed.
-# returns true if it adds rss site or updates the hash.
-def add_or_update_rss_site(rss_site):
-
-    html = requests.get(rss_site[1])
-    page_hash = hashlib.sha256(html.text.encode("utf-8")).hexdigest()
-
-    id,out_url,out_hash = rss_site
-
-    if(out_hash == page_hash):
-        print("same hash ignoring: ", rss_site[1])
-        return False
-    else:
-        print("different hash, needs update: ", rss_site[1])
-        helper_insert_db("UPDATE rss_sites SET hash=%s WHERE id=%s", (page_hash, id))
-        return True 
-
-
-
-
-def start_news_schedueler():
-    scheduler = BackgroundScheduler()
-    print("schedueling job for 1 minute...")
-    job = scheduler.add_job(get_web_articles_rss, 'interval', minutes=1)
-    scheduler.start()
-    
 
 
 # TODO Ai as a judge to exclude minor changes of an article, but this means the article itself has to be checked not only description and title.
@@ -90,19 +51,38 @@ def article_exists(new_title,new_publ,new_content):
 
 
 
+
+# Fetches recent articles from known RSS sites. 
 def get_web_articles_rss():
 
+    global dt_old_rss_fetch_update
+
+    # Removes articles older than a full day.
+    helper_insert_db("delete from news_articles_rss WHERE published_at < (NOW() - '1 days'::interval);", None)
+
     rss_sites = helper_select_db("SELECT * FROM rss_sites",None)
-    rss_sites_filtered = check_rss_sites_to_fetch_articles(rss_sites)
 
-    for rss_site in rss_sites_filtered:
+    articles = []
+    insert_queries = []
 
-        print("getting web rss articles...")
+    for rss_site in rss_sites:
 
-        articles = []
+        print("Fetching RSS article...")
         rss_url = rss_site[1]
         response = get(rss_url)
-        rss_response = RSSParser.parse(response.text)
+
+        str_builder = ""
+        articles_per_rss = []
+        
+
+        try:
+            rss_response = RSSParser.parse(response.text)
+        except ExpatError as e:
+            print(f"Skipping feed {rss_url}: invalid XML/RSS. Error: {e}")
+            continue
+        except Exception as e:
+            print(f"skipping {rss_url}, unkown error")
+            continue
 
         for item in rss_response.channel.items:
 
@@ -113,25 +93,92 @@ def get_web_articles_rss():
             article.url = item.links[0].content if item.links else None
             article.descr = item.description.content if item.description else None
 
+            str_builder+=(article.title if not None else "" + article.published if not None else "" + article.url if not None else "" + article.descr if not None else "")
+            articles_per_rss.append(article)
+        
+        new_hash = hashlib.sha256(str_builder.encode("utf-8")).hexdigest()
+        old_hash = rss_site[2]
 
-            # Avoid adding it if it already is in the db
-            if(article_exists(article.title, article.published, article.descr)):
-                continue
-
-            articles.append(article)
+        if(new_hash == old_hash):
+            print("rss: " + rss_site[1] + "same hash ignoring articles.")
+        else:
+            print("rss changed: " + rss_site[1] + " adding articles. ")
             
+            articles.extend(articles_per_rss)
 
-        subscriptions = helper_select_db("SELECT id, embedding FROM news_subscriptions", None)
+            # updating db hash
+            values = (new_hash, rss_site[1])
+            insert_query = "UPDATE rss_sites SET hash=%s WHERE url=%s"
+            insert_queries.append((insert_query,values))
 
+    helper_insert_many_db(insert_queries)
+
+    # now go through articles on the rss sites on which the articles has been changed.
+    # and select those that are close in time
+    insert_queries = []
+    for article in articles:
+
+        # Skip articles without published dates for now.
+        if article.published is None:
+            continue
+
+        # Also skip articles with no title or description
+        if(article.title is None and article .descr is None):
+            continue 
+
+        # TODO might instead use global time update indicator in db
+        if dt_old_rss_fetch_update is None:
+            dt_old_rss_fetch_update = datetime.now(timezone.utc)-timedelta(minutes=5)
+
+        # only add articles that are new
+        try:
+            # RFC 2822
+            dt_article = parsedate_to_datetime(article.published)
+        except Exception:
+            # ISO 8601
+            dt_article = datetime.fromisoformat(article.published)
+
+        # keep everything in utc format.
+        dt_article = dt_article.astimezone(timezone.utc)
         
 
-        for article in articles:
-            
-            if(article.title is None and article .descr is None):
-                continue # skip this article for now.
+        if( (dt_article > dt_old_rss_fetch_update) and dt_article > (datetime.now(timezone.utc)-timedelta(minutes=5))):
+            print("New article found")
+        else:
+            continue
 
-            embedding_str = (article.title if article.title is not None else "") + (article.descr if article.descr is not None else "")
-            article_embedding = createEmbedding(embedding_str)
+        # If date does not exist, check if it is already added.
+        if(article_exists(article.title, article.published, article.descr)):
+            print("Tried to add article that already exists.")
+            continue
+
+        print("inserting the new article...")
+        
+        embedding_str = (article.title if article.title is not None else "") + (article.descr if article.descr is not None else "")
+        art_emb = createEmbedding(embedding_str)
+
+        values = (None,article.title,article.published,article.url,article.descr,art_emb)
+        insert_query = ("INSERT INTO news_articles_rss (source, title, published_at, url, content, embedding) VALUES (%s,%s,%s,%s,%s,%s)")
+        insert_queries.append((insert_query,values))
+
+
+    helper_insert_many_db(insert_queries)
+            
+       
+
+    dt_old_rss_fetch_update = datetime.now(timezone.utc)
+
+
+    # adding full article text and chunking it.
+    update_or_add_full_news_articles_from_rss()
+
+
+get_web_articles_rss()
+'''
+        subscriptions = helper_select_db("SELECT id, embedding FROM news_subscriptions", None)
+
+
+           
 
             for id, subscription_embedding in subscriptions:
                 
@@ -144,36 +191,6 @@ def get_web_articles_rss():
                 print("cosine is: ", cosine)
 
                 if(cosine > 0.4):
-                    print("inserting article that matched subscription...")
-                    values = (id,None,article.title,article.published,article.url,article.descr,art_emb)
-                    insert_query = ("INSERT INTO news_articles_rss (news_subscription_id, source, title, published_at, url, content, embedding) VALUES (%s,%s,%s,%s,%s,%s,%s)")
-                    helper_insert_db(insert_query, values)
 
-        pass
 
-get_web_articles_rss()
-
-#connection = psycopg2.connect(database="postgres", user="postgres", password="3166", host="localhost", port=5432)
-#cursor = connection.cursor()
-#insert_query = "INSERT INTO news_articles (source, title, published_at, url, content, embedding) VALUES (%s,%s,%s,%s,%s,%s)"
-
-#for article in articles:
-#    print("title", article.title)
-#    print("pub", article.published)
-#    print("url", article.url)
-#    print("descr", article.descr)
-#    cursor.execute(insert_query,(None,article.title,article.published,article.url,article.descr,None))
-
-#connection.commit()
-#print("inserted")
-#cursor.close()
-#connection.close()
-#    id bigserial primary key,
-#   source text,
-#   title text,
-#  published_at timestamp,
-#  url text,
-#  content text,
-#  embedding vector(1536)
-
-#chunking should be 200-800 tokens..., can start with one chunk intro.
+'''

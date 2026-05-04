@@ -25,3 +25,22 @@ def helper_insert_db(insert_query, values):
     cursor.close()
     connection.commit()
     connection.close()
+
+
+def helper_insert_many_db(entries):
+    connection = psycopg2.connect(
+        database="postgres",
+        user="postgres",
+        password="3166",
+        host="localhost",
+        port=5432
+    )
+
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                for insert_query, values in entries:
+                    cursor.execute(insert_query, values)
+
+    finally:
+        connection.close()

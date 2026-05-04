@@ -4,10 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from pydantic import BaseModel
 import modal
-from rss import start_news_schedueler
+from rss import get_web_articles_rss
 from openai import OpenAI
 import db
+from apscheduler.schedulers.background import BackgroundScheduler
 
+scheduler = BackgroundScheduler()
 client = OpenAI()
 
 def createEmbedding(str):
@@ -34,7 +36,7 @@ run_model = modal.Function.from_name("sandbox","run_model")
 
 
 prompt = "Give me a short introduction to large language model."
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
 #model_name="HuggingFaceTB/SmolLM-360M-Instruct"
 
 # modal deploy model.py
@@ -55,8 +57,12 @@ class Subscription(BaseModel):
 # initialisations here, runs before application starts.
 @app.on_event("startup")
 async def startup_event():
-    print("starting....")
-    start_news_schedueler()
+    job = scheduler.add_job(get_web_articles_rss, 'interval', minutes=1)
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def shutdown_schedueler():
+    scheduler.shutdown()
 
 @app.get("/newsubscription")
 def get_subscriptions():
@@ -71,11 +77,52 @@ def get_subscriptions():
     return data
 
 @app.post("/newsubscription")
-def create_subscription(sub: Subscription):
+async def create_subscription(sub: Subscription):
     connection = psycopg2.connect(database="postgres", user="postgres", password=db.DATABASE_PASSWORD, host=db.DATABASE_HOST, port=db.DATABASE_PORT)
     cursor = connection.cursor()
 
-    embedding = createEmbedding(sub.title+sub.description)
+    # query expansion
+    prompt = f"""
+    You are expanding a news subscription query for article retrieval.
+
+    Subscription:
+    "{sub.title + sub.description}"
+
+    
+    Return ONLY a JSON array of strings.
+
+    Rules:
+    - Do NOT repeat the main keyword from the subscription.
+    - Return modifiers that can be combined with the main keyword.
+    - Do NOT create full search queries.
+    - Do NOT add unrelated topics.
+    - Do NOT add old events unless explicitly mentioned.
+    - Prefer terms like sources, event types, roles, organizations, actions, and formats.
+    - Return at most 8 strings.
+    - If no useful modifiers exist, return [].
+
+    Example:
+    Subscription: "everything new about Trump"
+    Output:
+    ["Truth Social", "administration", "statement", "interview", "press conference", "executive order", "White House"]
+
+    Example:
+    Subscription: "Ukraine war"
+    Output:
+    ["drone attack", "missile strike", "peace talks", "front line", "air defense", "Kyiv", "Donetsk"]
+
+    Example:
+    Subscription: "Tesla layoffs"
+    Output:
+    ["job cuts", "workforce reduction", "employees", "factory", "Elon Musk"]
+
+    JSON only.
+    """
+
+    query_expansion : str = await get_model_response(model_name, prompt)
+    #print("query expansion is: ", query_expansion)
+
+    embedding = createEmbedding(sub.title+sub.description+query_expansion)
 
     insert_query = "INSERT INTO news_subscriptions (title, description, embedding) VALUES (%s,%s, %s)"
     cursor.execute(insert_query, (sub.title, sub.description, embedding))
@@ -126,3 +173,5 @@ async def edit_subscription_page(id: int, request: Request):
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
     #http://127.0.0.1:8000 
+
+

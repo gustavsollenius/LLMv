@@ -34,7 +34,7 @@ def run_model(model_name, prompt):
 
     
     messages = [
-        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": prompt}
     ]
     text = tokenizer.apply_chat_template(
@@ -46,7 +46,11 @@ def run_model(model_name, prompt):
 
     generated_ids = hf_model.generate(
         **model_inputs,
-        max_new_tokens=512
+        max_new_tokens=512,
+        temperature=0.1,
+        top_p=0.8,
+        do_sample=True,
+        repetition_penalty=1.1,
     )
     generated_ids = [
         output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -54,4 +58,6 @@ def run_model(model_name, prompt):
 
     response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
     return response
+
+
 
